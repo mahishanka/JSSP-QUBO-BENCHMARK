@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+!pip -q install ortools dimod dwave-neal pandas matplotlib numpy
 JSP-QUBO Benchmark
 
 This script compares two QUBO formulations for the Job-Shop Scheduling Problem:
