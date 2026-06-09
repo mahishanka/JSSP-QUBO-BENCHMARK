@@ -1045,4 +1045,111 @@ def run_benchmark(args):
     print()
 
     print("Running CP-SAT optimization reference...")
-    opt_ref = solve_jsp_cps
+    opt_ref = solve_jsp_cpsat_optimize(JOBS_DATA, time_limit=args.cpsat_time_limit)
+    print("CP-SAT optimization reference:")
+    print(f"  status: {opt_ref['status']}")
+    print(f"  makespan: {opt_ref['makespan']}")
+    print(f"  time_sec: {opt_ref['time']:.4f}")
+    print()
+
+    results = [
+        benchmark_fixed_C(
+            JOBS_DATA,
+            C,
+            num_reads=args.num_reads,
+            num_sweeps=args.num_sweeps,
+            seed=args.seed,
+            cpsat_time_limit=args.cpsat_time_limit,
+        )
+        for C in args.c_values
+    ]
+    results_df = pd.concat(results, ignore_index=True)
+
+    results_path = output_dir / "jsp_qubo_benchmark_results.csv"
+    ratios_path = output_dir / "jsp_qubo_reduction_ratios.csv"
+
+    results_df.to_csv(results_path, index=False)
+    print(f"Saved detailed benchmark results to {results_path}")
+
+    ratios_df = compute_reduction_ratios(results_df, args.c_values)
+    ratios_df.to_csv(ratios_path, index=False)
+    print(f"Saved reduction ratios to {ratios_path}")
+
+    qubo_results = results_df[
+        results_df["model"].isin(["Time-indexed QUBO", "Compact disjunctive QUBO"])
+    ].copy()
+
+    save_comparison_plot(
+        qubo_results,
+        "binary_vars",
+        "Binary variables",
+        "QUBO variable count comparison",
+        output_dir / "qubo_variable_count_comparison.png",
+    )
+    save_comparison_plot(
+        qubo_results,
+        "quadratic_terms",
+        "Quadratic terms",
+        "QUBO quadratic terms comparison",
+        output_dir / "qubo_quadratic_terms_comparison.png",
+    )
+    save_comparison_plot(
+        qubo_results,
+        "time_sec",
+        "Runtime (s)",
+        "QUBO runtime comparison",
+        output_dir / "qubo_runtime_comparison.png",
+    )
+
+    print("Saved comparison plots to:")
+    print(f"  {output_dir / 'qubo_variable_count_comparison.png'}")
+    print(f"  {output_dir / 'qubo_quadratic_terms_comparison.png'}")
+    print(f"  {output_dir / 'qubo_runtime_comparison.png'}")
+
+    return results_df, ratios_df
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark QUBO formulations for FT06 JSP")
+    parser.add_argument(
+        "--c-values",
+        type=int,
+        nargs="+",
+        default=[53, 54, 55, 56, 58, 60],
+        help="Fixed makespan values C to benchmark.",
+    )
+    parser.add_argument(
+        "--num-reads",
+        type=int,
+        default=100,
+        help="Number of simulated annealing reads.",
+    )
+    parser.add_argument(
+        "--num-sweeps",
+        type=int,
+        default=1000,
+        help="Number of simulated annealing sweeps per read.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for simulated annealing.",
+    )
+    parser.add_argument(
+        "--cpsat-time-limit",
+        type=float,
+        default=5.0,
+        help="CP-SAT time limit in seconds for fixed-C feasibility checks.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="outputs",
+        help="Directory where benchmark outputs will be written.",
+    )
+    args = parser.parse_args()
+    run_benchmark(args)
+
+
+if __name__ == "__main__":
+    main()

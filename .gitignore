@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Benchmark outputs
+outputs/
+*.log
+
+# Editor/system noise
+.vscode/
+.DS_Store
