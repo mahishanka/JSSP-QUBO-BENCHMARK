@@ -673,6 +673,7 @@ def solve_jsp_cpsat_fixed_C(jobs_data, C, time_limit=5.0):
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.num_search_workers = 1
 
     start_time = time.perf_counter()
     status = solver.Solve(model)
@@ -744,6 +745,7 @@ def solve_jsp_cpsat_optimize(jobs_data, time_limit=20.0):
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.num_search_workers = 1
 
     start_time = time.perf_counter()
     status = solver.Solve(model)

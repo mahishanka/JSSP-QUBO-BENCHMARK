@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 
 from run_instance_benchmark import load_dataset, run_instance_benchmark
@@ -24,7 +25,7 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
         print("Please enter y or n.")
 
 
-def ask_int(prompt: str, default: int) -> int:
+def ask_int(prompt: str, default: int, minimum: int | None = None) -> int:
     """
     Ask for an integer, with a default value.
     """
@@ -32,15 +33,22 @@ def ask_int(prompt: str, default: int) -> int:
         answer = input(f"{prompt} [{default}]: ").strip()
 
         if answer == "":
-            return default
+            value = default
+        else:
+            try:
+                value = int(answer)
+            except ValueError:
+                print("Please enter an integer.")
+                continue
 
-        try:
-            return int(answer)
-        except ValueError:
-            print("Please enter an integer.")
+        if minimum is not None and value < minimum:
+            print(f"Please enter an integer at least {minimum}.")
+            continue
+
+        return value
 
 
-def ask_float(prompt: str, default: float) -> float:
+def ask_float(prompt: str, default: float, minimum: float | None = None) -> float:
     """
     Ask for a float, with a default value.
     """
@@ -48,47 +56,34 @@ def ask_float(prompt: str, default: float) -> float:
         answer = input(f"{prompt} [{default}]: ").strip()
 
         if answer == "":
-            return default
+            value = default
+        else:
+            try:
+                value = float(answer)
+            except ValueError:
+                print("Please enter a number.")
+                continue
 
-        try:
-            return float(answer)
-        except ValueError:
-            print("Please enter a number.")
-
-
-def ask_c_values():
-    """
-    Ask whether to use automatic C-values or custom C-values.
-    """
-    use_auto = ask_yes_no(
-        "Use automatic C-values from known optimum/lower/upper bounds?",
-        default=True,
-    )
-
-    if use_auto:
-        return None
-
-    while True:
-        answer = input(
-            "Enter C-values separated by spaces, e.g. 53 54 55 56 58 60: "
-        ).strip()
-
-        try:
-            values = [int(x) for x in answer.split()]
-        except ValueError:
-            print("Please enter only integers separated by spaces.")
+        if minimum is not None and value < minimum:
+            print(f"Please enter a number at least {minimum}.")
             continue
 
-        if not values:
-            print("Please enter at least one C-value.")
-            continue
-
-        return values
+        return value
 
 
-def ask_instance_name(instances: dict) -> str:
+def parse_instance_names(raw: str) -> list[str]:
     """
-    Ask the user which instance to run.
+    Accept either spaces or commas:
+        ft06 la01
+        ft06, la01
+    """
+    cleaned = raw.replace(",", " ")
+    return [x.strip().lower() for x in cleaned.split() if x.strip()]
+
+
+def ask_instance_names(instances: dict) -> list[str]:
+    """
+    Ask the user which instances to run.
     """
     names = sorted(instances)
 
@@ -110,12 +105,23 @@ def ask_instance_name(instances: dict) -> str:
         print()
 
     while True:
-        instance_name = input("Which instance do you want to run? ").strip().lower()
+        raw = input(
+            "Which instance(s) do you want to run? "
+            "Use spaces or commas, e.g. ft06 la01: "
+        ).strip()
 
-        if instance_name in instances:
-            return instance_name
+        instance_names = parse_instance_names(raw)
 
-        print(f"Unknown instance: {instance_name}")
+        if not instance_names:
+            print("Please enter at least one instance name.")
+            continue
+
+        unknown = [name for name in instance_names if name not in instances]
+
+        if not unknown:
+            return list(dict.fromkeys(instance_names))
+
+        print(f"Unknown instance(s): {', '.join(unknown)}")
         print("Try something like ft06, la01, abz5, orb01, swv01, or yn1.")
 
 
@@ -155,12 +161,83 @@ def ask_run_mode():
 
         if choice == "3":
             return {
-                "num_reads": ask_int("Number of simulated annealing reads", 100),
-                "num_sweeps": ask_int("Number of simulated annealing sweeps", 1000),
-                "cpsat_time_limit": ask_float("CP-SAT time limit in seconds", 5.0),
+                "num_reads": ask_int(
+                    "Number of simulated annealing reads",
+                    100,
+                    minimum=1,
+                ),
+                "num_sweeps": ask_int(
+                    "Number of simulated annealing sweeps",
+                    1000,
+                    minimum=1,
+                ),
+                "cpsat_time_limit": ask_float(
+                    "CP-SAT time limit in seconds",
+                    5.0,
+                    minimum=0.0,
+                ),
             }
 
         print("Please choose 1, 2, or 3.")
+
+
+def ask_c_values():
+    """
+    Ask whether to use automatic C-values or custom C-values.
+
+    Custom C-values apply to every selected instance.
+    """
+    use_auto = ask_yes_no(
+        "Use automatic C-values from known optimum/lower/upper bounds?",
+        default=True,
+    )
+
+    if use_auto:
+        return None
+
+    print()
+    print("Custom C-values will be used for every selected instance.")
+
+    while True:
+        answer = input(
+            "Enter C-values separated by spaces, e.g. 53 54 55 56 58 60: "
+        ).strip()
+
+        try:
+            values = [int(x) for x in answer.split()]
+        except ValueError:
+            print("Please enter only integers separated by spaces.")
+            continue
+
+        if not values:
+            print("Please enter at least one C-value.")
+            continue
+
+        return list(dict.fromkeys(values))
+
+
+def ask_max_workers() -> int:
+    """
+    Ask how many total worker processes to use.
+    """
+    cpu_count = os.cpu_count() or 1
+
+    print()
+    print("Parallelism setting:")
+    print(
+        "The program parallelizes over all selected (instance, C) pairs. "
+        "For example, 2 instances with 6 C-values each gives 12 independent tasks."
+    )
+    print(f"Detected logical CPUs: {cpu_count}")
+    print("Use 1 for sequential execution.")
+    print("For large instances, using too many workers can run out of memory.")
+    print()
+
+    return ask_int(
+        "Total worker processes to use",
+        default=1,
+        minimum=1,
+    )
 
 
 def main():
@@ -177,22 +254,30 @@ def main():
     dataset = load_dataset()
     instances = dataset["instances"]
 
-    instance_name = ask_instance_name(instances)
+    instance_names = ask_instance_names(instances)
     run_settings = ask_run_mode()
     c_values = ask_c_values()
+    max_workers = ask_max_workers()
     seed = ask_int("Random seed", 1)
+
+    run_extra_cpsat_opt = ask_yes_no(
+        "Run extra CP-SAT optimization reference before fixed-C benchmarks?",
+        default=True,
+    )
 
     print()
     print("=" * 70)
     print("Run summary")
     print("=" * 70)
-    print(f"Instance: {instance_name}")
-    print(f"C-values: {'automatic' if c_values is None else c_values}")
+    print(f"Instances: {', '.join(instance_names)}")
+    print(f"C-values: {'automatic per instance' if c_values is None else c_values}")
     print(f"num_reads: {run_settings['num_reads']}")
     print(f"num_sweeps: {run_settings['num_sweeps']}")
     print(f"cpsat_time_limit: {run_settings['cpsat_time_limit']}")
+    print(f"max_workers: {max_workers}")
     print(f"seed: {seed}")
-    print("Output folder: outputs/<instance>-<timestamp>/")
+    print(f"extra CP-SAT optimize reference: {run_extra_cpsat_opt}")
+    print("Output folders: outputs/<instance>-<timestamp>/")
     print()
 
     proceed = ask_yes_no("Start benchmark?", default=True)
@@ -202,13 +287,15 @@ def main():
         return
 
     args = Namespace(
-        instance=instance_name,
+        instances=instance_names,
         list_instances=False,
         c_values=c_values,
         num_reads=run_settings["num_reads"],
         num_sweeps=run_settings["num_sweeps"],
         seed=seed,
         cpsat_time_limit=run_settings["cpsat_time_limit"],
+        max_workers=max_workers,
+        skip_cpsat_optimize=not run_extra_cpsat_opt,
         output_dir="outputs",
     )
 
