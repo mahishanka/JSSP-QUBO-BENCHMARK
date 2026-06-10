@@ -7,10 +7,13 @@ from pathlib import Path
 import pandas as pd
 
 from jsp_qubo_benchmark import (
+    BENCHMARK_LABELS,
     benchmark_fixed_C,
     compute_reduction_ratios,
+    normalize_benchmarks,
     save_comparison_plot,
     solve_jsp_cpsat_optimize,
+    solve_jsp_tn_lns,
 )
 
 
@@ -173,6 +176,7 @@ def save_run_metadata(
             "cpsat_time_limit": args.cpsat_time_limit,
             "max_workers_total": args.max_workers,
             "skip_cpsat_optimize": args.skip_cpsat_optimize,
+            "benchmarks": list(args.benchmarks),
         },
         "cpsat_optimize_reference": cpsat_opt_ref,
         "instance_metadata": {
@@ -224,7 +228,10 @@ def save_outputs(
 
     qubo_results = results_df[
         results_df["model"].isin(
-            ["Time-indexed QUBO", "Compact disjunctive QUBO"]
+            [
+                BENCHMARK_LABELS["time_indexed_qubo"],
+                BENCHMARK_LABELS["compact_disjunctive_qubo"],
+            ]
         )
     ].copy()
 
@@ -245,11 +252,32 @@ def save_outputs(
     )
 
     save_comparison_plot(
-        qubo_results,
+        results_df,
         "time_sec",
         "Runtime (s)",
-        f"{instance_name}: QUBO runtime comparison",
-        output_dir / f"{instance_name}_qubo_runtime_comparison.png",
+        f"{instance_name}: benchmark runtime comparison",
+        output_dir / f"{instance_name}_benchmark_runtime_comparison.png",
+    )
+
+    save_comparison_plot(
+        results_df,
+        "makespan",
+        "Makespan",
+        f"{instance_name}: benchmark makespan comparison",
+        output_dir / f"{instance_name}_benchmark_makespan_comparison.png",
+    )
+
+    feasibility_results = results_df.copy()
+    feasibility_results["feasible_found"] = (
+        feasibility_results["feasible_found"].fillna(False).astype(bool).astype(int)
+    )
+
+    save_comparison_plot(
+        feasibility_results,
+        "feasible_found",
+        "Feasible found (1=yes, 0=no)",
+        f"{instance_name}: benchmark feasibility comparison",
+        output_dir / f"{instance_name}_benchmark_feasibility_comparison.png",
     )
 
     print()
@@ -258,7 +286,9 @@ def save_outputs(
     print(f"  {ratios_path}")
     print(f"  {output_dir / f'{instance_name}_qubo_variable_count_comparison.png'}")
     print(f"  {output_dir / f'{instance_name}_qubo_quadratic_terms_comparison.png'}")
-    print(f"  {output_dir / f'{instance_name}_qubo_runtime_comparison.png'}")
+    print(f"  {output_dir / f'{instance_name}_benchmark_runtime_comparison.png'}")
+    print(f"  {output_dir / f'{instance_name}_benchmark_makespan_comparison.png'}")
+    print(f"  {output_dir / f'{instance_name}_benchmark_feasibility_comparison.png'}")
 
 
 def run_one_instance_c_task(task: dict):
@@ -275,6 +305,9 @@ def run_one_instance_c_task(task: dict):
         num_sweeps=task["num_sweeps"],
         seed=task["seed"],
         cpsat_time_limit=task["cpsat_time_limit"],
+        benchmarks=task["benchmarks"],
+        known_optimum=task["known_optimum"],
+        tn_result=task.get("tn_result"),
     )
 
     return task["instance_name"], task["C"], df
@@ -381,6 +414,8 @@ def run_instance_benchmark(args):
     if args.max_workers < 1:
         raise ValueError("--max-workers must be at least 1.")
 
+    args.benchmarks = normalize_benchmarks(getattr(args, "benchmarks", None))
+
     instance_names = select_instance_names(args, instances)
     custom_c_values = normalize_custom_c_values(args.c_values)
 
@@ -396,11 +431,16 @@ def run_instance_benchmark(args):
     c_values_by_instance = {}
     output_dirs_by_instance = {}
     cpsat_opt_refs = {}
+    tn_results_by_instance = {}
 
     print("=" * 70)
     print("JSSP-QUBO multi-instance benchmark")
     print("=" * 70)
     print(f"Selected instances: {', '.join(instance_names)}")
+    print(
+        "Selected benchmarks: "
+        + ", ".join(BENCHMARK_LABELS[name] for name in args.benchmarks)
+    )
     print(f"Total worker processes requested: {args.max_workers}")
     print(f"Run timestamp: {run_timestamp}")
     print()
@@ -414,7 +454,15 @@ def run_instance_benchmark(args):
 
         print_instance_summary(instance_name, instance_record)
 
-        if args.skip_cpsat_optimize:
+        if "cpsat" not in args.benchmarks:
+            cpsat_opt_ref = {
+                "status": "SKIPPED",
+                "makespan": None,
+                "time": None,
+            }
+            print("Skipping CP-SAT optimization reference because CP-SAT is not selected.")
+            print()
+        elif args.skip_cpsat_optimize:
             cpsat_opt_ref = {
                 "status": "SKIPPED",
                 "makespan": None,
@@ -445,6 +493,22 @@ def run_instance_benchmark(args):
             print()
 
         cpsat_opt_refs[instance_name] = cpsat_opt_ref
+
+        if "tn_lns" in args.benchmarks:
+            print(f"Running TN-LNS reference for {instance_name}...")
+            tn_result = solve_jsp_tn_lns(
+                jobs_data,
+                optimum=instance_record.get("optimum"),
+                seed=args.seed,
+            )
+            tn_results_by_instance[instance_name] = tn_result
+            print("TN-LNS reference:")
+            print(f"  status: {tn_result['status']}")
+            print(f"  makespan: {tn_result['makespan']}")
+            print(f"  time_sec: {tn_result['time']:.4f}")
+            print()
+        else:
+            tn_results_by_instance[instance_name] = None
 
         if custom_c_values is not None:
             c_values = custom_c_values
@@ -490,6 +554,9 @@ def run_instance_benchmark(args):
                     "num_sweeps": args.num_sweeps,
                     "seed": args.seed,
                     "cpsat_time_limit": args.cpsat_time_limit,
+                    "benchmarks": args.benchmarks,
+                    "known_optimum": instance_records[instance_name].get("optimum"),
+                    "tn_result": tn_results_by_instance.get(instance_name),
                 }
             )
 
@@ -655,6 +722,17 @@ def main():
         type=float,
         default=5.0,
         help="CP-SAT time limit in seconds.",
+    )
+
+    parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        default=None,
+        help=(
+            "Benchmarks to run. Default: all. "
+            "Use any of: cpsat, time_indexed_qubo, compact_disjunctive_qubo, "
+            "tn_lns. Aliases such as classical, ti, compact, and tn are accepted."
+        ),
     )
 
     parser.add_argument(

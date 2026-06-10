@@ -15,7 +15,9 @@ Outputs:
     outputs/jsp_qubo_reduction_ratios.csv
     outputs/qubo_variable_count_comparison.png
     outputs/qubo_quadratic_terms_comparison.png
-    outputs/qubo_runtime_comparison.png
+    outputs/benchmark_runtime_comparison.png
+    outputs/benchmark_makespan_comparison.png
+    outputs/benchmark_feasibility_comparison.png
 """
 
 import argparse
@@ -50,6 +52,73 @@ JOBS_DATA = [
 ]
 
 KNOWN_OPTIMUM = 55
+
+BENCHMARK_LABELS = {
+    "cpsat": "CP-SAT fixed C",
+    "time_indexed_qubo": "Time-indexed QUBO",
+    "compact_disjunctive_qubo": "Compact disjunctive QUBO",
+    "tn_lns": "QI Compact-QUBO TN-LNS",
+}
+
+DEFAULT_BENCHMARKS = tuple(BENCHMARK_LABELS)
+
+BENCHMARK_ALIASES = {
+    "all": "all",
+    "cpsat": "cpsat",
+    "cp-sat": "cpsat",
+    "cp_sat": "cpsat",
+    "classical": "cpsat",
+    "time": "time_indexed_qubo",
+    "time-indexed": "time_indexed_qubo",
+    "time_indexed": "time_indexed_qubo",
+    "time-indexed-qubo": "time_indexed_qubo",
+    "time_indexed_qubo": "time_indexed_qubo",
+    "ti": "time_indexed_qubo",
+    "compact": "compact_disjunctive_qubo",
+    "compact-qubo": "compact_disjunctive_qubo",
+    "compact_disjunctive_qubo": "compact_disjunctive_qubo",
+    "compact-disjunctive-qubo": "compact_disjunctive_qubo",
+    "cd": "compact_disjunctive_qubo",
+    "tn": "tn_lns",
+    "tn-lns": "tn_lns",
+    "tn_lns": "tn_lns",
+    "qi-tn": "tn_lns",
+    "qi_tn": "tn_lns",
+    "qi-compact-qubo-tn-lns": "tn_lns",
+}
+
+
+def normalize_benchmarks(benchmarks=None):
+    """
+    Normalize requested benchmark names while preserving the default order.
+    """
+    if benchmarks is None:
+        return list(DEFAULT_BENCHMARKS)
+
+    normalized = []
+
+    for raw_name in benchmarks:
+        key = str(raw_name).strip().lower()
+
+        if not key:
+            continue
+
+        if key == "all":
+            return list(DEFAULT_BENCHMARKS)
+
+        name = BENCHMARK_ALIASES.get(key)
+
+        if name is None:
+            valid = ", ".join(BENCHMARK_LABELS)
+            raise ValueError(f"Unknown benchmark '{raw_name}'. Valid names: {valid}")
+
+        if name not in normalized:
+            normalized.append(name)
+
+    if not normalized:
+        return list(DEFAULT_BENCHMARKS)
+
+    return [name for name in DEFAULT_BENCHMARKS if name in normalized]
 
 
 # ============================================================
@@ -776,6 +845,103 @@ def solve_jsp_cpsat_optimize(jobs_data, time_limit=20.0):
     }
 
 
+def solve_jsp_tn_lns(jobs_data, optimum=None, seed=0):
+    """
+    Run the quantum-inspired compact-QUBO tensor-network LNS method.
+
+    The TN implementation is an improvement layer, so this wrapper builds the
+    greedy and local-search incumbent it expects, then reports one schedule that
+    can be checked against each fixed makespan C.
+    """
+    try:
+        from jssp_qi_tn_benchmark import (
+            LOCAL_SEARCH_ROUNDS,
+            best_greedy,
+            check_schedule as check_tn_schedule,
+            local_search,
+            qi_compact_qubo_tn_lns,
+        )
+    except Exception as exc:
+        return {
+            "status": f"ERROR importing TN solver: {exc}",
+            "feasible": False,
+            "starts": None,
+            "makespan": None,
+            "time": np.nan,
+            "sweeps": 0,
+        }
+
+    start_time = time.perf_counter()
+
+    try:
+        greedy = best_greedy(jobs_data)
+        greedy_feasible, greedy_makespan = check_tn_schedule(
+            jobs_data,
+            greedy["starts"],
+        )
+
+        if not greedy_feasible:
+            elapsed = time.perf_counter() - start_time
+            return {
+                "status": "Greedy warm start infeasible",
+                "feasible": False,
+                "starts": None,
+                "makespan": None,
+                "time": elapsed,
+                "sweeps": 0,
+            }
+
+        ls_starts, ls_makespan, _ = local_search(
+            jobs_data,
+            greedy["starts"],
+            max_rounds=LOCAL_SEARCH_ROUNDS,
+        )
+        ls_feasible, ls_checked_makespan = check_tn_schedule(jobs_data, ls_starts)
+
+        if ls_feasible:
+            incumbent_starts = ls_starts
+            incumbent_makespan = ls_checked_makespan
+        else:
+            incumbent_starts = greedy["starts"]
+            incumbent_makespan = greedy_makespan
+
+        tn_starts, tn_makespan, _, tn_sweeps = qi_compact_qubo_tn_lns(
+            jobs_data,
+            incumbent_starts,
+            optimum,
+            seed=seed,
+        )
+
+        if tn_starts is not None and tn_makespan is not None:
+            tn_feasible, tn_checked_makespan = check_tn_schedule(jobs_data, tn_starts)
+
+            if tn_feasible and tn_checked_makespan <= incumbent_makespan:
+                incumbent_starts = tn_starts
+                incumbent_makespan = tn_checked_makespan
+
+        elapsed = time.perf_counter() - start_time
+
+        return {
+            "status": f"OK; TN sweeps={tn_sweeps}",
+            "feasible": True,
+            "starts": incumbent_starts,
+            "makespan": incumbent_makespan,
+            "time": elapsed,
+            "sweeps": tn_sweeps,
+        }
+
+    except Exception as exc:
+        elapsed = time.perf_counter() - start_time
+        return {
+            "status": f"ERROR: {exc}",
+            "feasible": False,
+            "starts": None,
+            "makespan": None,
+            "time": elapsed,
+            "sweeps": 0,
+        }
+
+
 # ============================================================
 # 7. Benchmark for one fixed makespan C
 # ============================================================
@@ -787,157 +953,199 @@ def benchmark_fixed_C(
     num_sweeps=1000,
     seed=1,
     cpsat_time_limit=5.0,
+    benchmarks=None,
+    known_optimum=None,
+    tn_result=None,
 ):
     """
-    Run CP-SAT, time-indexed QUBO, and compact disjunctive QUBO
-    for one fixed makespan value C.
+    Run selected fixed-C benchmark rows.
     """
+    benchmarks = normalize_benchmarks(benchmarks)
     rows = []
 
     # CP-SAT reference.
-    cpsat = solve_jsp_cpsat_fixed_C(
-        jobs_data,
-        C,
-        time_limit=cpsat_time_limit,
-    )
-
-    if cpsat["starts"] is not None:
-        cp_feasible, cp_makespan, cp_msg = check_schedule(
+    if "cpsat" in benchmarks:
+        cpsat = solve_jsp_cpsat_fixed_C(
             jobs_data,
-            cpsat["starts"],
             C,
+            time_limit=cpsat_time_limit,
         )
-    else:
-        cp_feasible, cp_makespan, cp_msg = False, None, cpsat["status"]
 
-    rows.append(
-        {
-            "C": C,
-            "model": "CP-SAT fixed C",
-            "solver": "OR-Tools CP-SAT",
-            "binary_vars": np.nan,
-            "quadratic_terms": np.nan,
-            "density": np.nan,
-            "coeff_ratio": np.nan,
-            "energy": np.nan,
-            "feasible_found": cp_feasible,
-            "makespan": cp_makespan,
-            "time_sec": cpsat["time"],
-            "status": cp_msg,
-        }
-    )
+        if cpsat["starts"] is not None:
+            cp_feasible, cp_makespan, cp_msg = check_schedule(
+                jobs_data,
+                cpsat["starts"],
+                C,
+            )
+        else:
+            cp_feasible, cp_makespan, cp_msg = False, None, cpsat["status"]
+
+        rows.append(
+            {
+                "C": C,
+                "model": BENCHMARK_LABELS["cpsat"],
+                "solver": "OR-Tools CP-SAT",
+                "binary_vars": np.nan,
+                "quadratic_terms": np.nan,
+                "density": np.nan,
+                "coeff_ratio": np.nan,
+                "energy": np.nan,
+                "feasible_found": cp_feasible,
+                "makespan": cp_makespan,
+                "time_sec": cpsat["time"],
+                "status": cp_msg,
+            }
+        )
 
     # Baseline time-indexed QUBO.
-    try:
-        qb_ti, meta_ti = build_time_indexed_qubo(jobs_data, C)
-        bqm_ti = qb_ti.to_bqm()
-        stats_ti = qb_ti.stats()
+    if "time_indexed_qubo" in benchmarks:
+        try:
+            qb_ti, meta_ti = build_time_indexed_qubo(jobs_data, C)
+            bqm_ti = qb_ti.to_bqm()
+            stats_ti = qb_ti.stats()
 
-        sol_ti = solve_qubo_with_neal(
-            bqm_ti,
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-            seed=seed,
-        )
+            sol_ti = solve_qubo_with_neal(
+                bqm_ti,
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                seed=seed,
+            )
 
-        starts_ti = decode_time_indexed_sample(
-            jobs_data,
-            sol_ti["sample"],
-            meta_ti,
-        )
+            starts_ti = decode_time_indexed_sample(
+                jobs_data,
+                sol_ti["sample"],
+                meta_ti,
+            )
 
-        feasible_ti, makespan_ti, msg_ti = check_schedule(
-            jobs_data,
-            starts_ti,
-            C,
-        )
+            feasible_ti, makespan_ti, msg_ti = check_schedule(
+                jobs_data,
+                starts_ti,
+                C,
+            )
 
-        rows.append(
-            {
-                "C": C,
-                "model": "Time-indexed QUBO",
-                "solver": "neal simulated annealing",
-                **stats_ti,
-                "energy": sol_ti["energy"],
-                "feasible_found": feasible_ti,
-                "makespan": makespan_ti,
-                "time_sec": sol_ti["time"],
-                "status": msg_ti,
-            }
-        )
+            rows.append(
+                {
+                    "C": C,
+                    "model": BENCHMARK_LABELS["time_indexed_qubo"],
+                    "solver": "neal simulated annealing",
+                    **stats_ti,
+                    "energy": sol_ti["energy"],
+                    "feasible_found": feasible_ti,
+                    "makespan": makespan_ti,
+                    "time_sec": sol_ti["time"],
+                    "status": msg_ti,
+                }
+            )
 
-    except Exception as exc:
-        rows.append(
-            {
-                "C": C,
-                "model": "Time-indexed QUBO",
-                "solver": "neal simulated annealing",
-                "binary_vars": np.nan,
-                "quadratic_terms": np.nan,
-                "density": np.nan,
-                "coeff_ratio": np.nan,
-                "energy": np.nan,
-                "feasible_found": False,
-                "makespan": np.nan,
-                "time_sec": np.nan,
-                "status": f"ERROR: {exc}",
-            }
-        )
+        except Exception as exc:
+            rows.append(
+                {
+                    "C": C,
+                    "model": BENCHMARK_LABELS["time_indexed_qubo"],
+                    "solver": "neal simulated annealing",
+                    "binary_vars": np.nan,
+                    "quadratic_terms": np.nan,
+                    "density": np.nan,
+                    "coeff_ratio": np.nan,
+                    "energy": np.nan,
+                    "feasible_found": False,
+                    "makespan": np.nan,
+                    "time_sec": np.nan,
+                    "status": f"ERROR: {exc}",
+                }
+            )
 
     # Compact disjunctive QUBO.
-    try:
-        qb_cd, meta_cd = build_compact_disjunctive_qubo(jobs_data, C)
-        bqm_cd = qb_cd.to_bqm()
-        stats_cd = qb_cd.stats()
+    if "compact_disjunctive_qubo" in benchmarks:
+        try:
+            qb_cd, meta_cd = build_compact_disjunctive_qubo(jobs_data, C)
+            bqm_cd = qb_cd.to_bqm()
+            stats_cd = qb_cd.stats()
 
-        sol_cd = solve_qubo_with_neal(
-            bqm_cd,
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-            seed=seed,
-        )
+            sol_cd = solve_qubo_with_neal(
+                bqm_cd,
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                seed=seed,
+            )
 
-        starts_cd = decode_compact_sample(
-            jobs_data,
-            sol_cd["sample"],
-            meta_cd,
-        )
+            starts_cd = decode_compact_sample(
+                jobs_data,
+                sol_cd["sample"],
+                meta_cd,
+            )
 
-        feasible_cd, makespan_cd, msg_cd = check_schedule(
-            jobs_data,
-            starts_cd,
-            C,
-        )
+            feasible_cd, makespan_cd, msg_cd = check_schedule(
+                jobs_data,
+                starts_cd,
+                C,
+            )
+
+            rows.append(
+                {
+                    "C": C,
+                    "model": BENCHMARK_LABELS["compact_disjunctive_qubo"],
+                    "solver": "neal simulated annealing",
+                    **stats_cd,
+                    "energy": sol_cd["energy"],
+                    "feasible_found": feasible_cd,
+                    "makespan": makespan_cd,
+                    "time_sec": sol_cd["time"],
+                    "status": msg_cd,
+                }
+            )
+
+        except Exception as exc:
+            rows.append(
+                {
+                    "C": C,
+                    "model": BENCHMARK_LABELS["compact_disjunctive_qubo"],
+                    "solver": "neal simulated annealing",
+                    "binary_vars": np.nan,
+                    "quadratic_terms": np.nan,
+                    "density": np.nan,
+                    "coeff_ratio": np.nan,
+                    "energy": np.nan,
+                    "feasible_found": False,
+                    "makespan": np.nan,
+                    "time_sec": np.nan,
+                    "status": f"ERROR: {exc}",
+                }
+            )
+
+    if "tn_lns" in benchmarks:
+        if tn_result is None:
+            tn_result = solve_jsp_tn_lns(
+                jobs_data,
+                optimum=known_optimum,
+                seed=seed,
+            )
+
+        if tn_result.get("starts") is not None:
+            tn_feasible, tn_makespan, tn_msg = check_schedule(
+                jobs_data,
+                tn_result["starts"],
+                C,
+            )
+        else:
+            tn_feasible = False
+            tn_makespan = tn_result.get("makespan")
+            tn_msg = tn_result.get("status", "TN solver did not return starts")
 
         rows.append(
             {
                 "C": C,
-                "model": "Compact disjunctive QUBO",
-                "solver": "neal simulated annealing",
-                **stats_cd,
-                "energy": sol_cd["energy"],
-                "feasible_found": feasible_cd,
-                "makespan": makespan_cd,
-                "time_sec": sol_cd["time"],
-                "status": msg_cd,
-            }
-        )
-
-    except Exception as exc:
-        rows.append(
-            {
-                "C": C,
-                "model": "Compact disjunctive QUBO",
-                "solver": "neal simulated annealing",
+                "model": BENCHMARK_LABELS["tn_lns"],
+                "solver": "tensor-network large-neighborhood search",
                 "binary_vars": np.nan,
                 "quadratic_terms": np.nan,
                 "density": np.nan,
                 "coeff_ratio": np.nan,
                 "energy": np.nan,
-                "feasible_found": False,
-                "makespan": np.nan,
-                "time_sec": np.nan,
-                "status": f"ERROR: {exc}",
+                "feasible_found": tn_feasible,
+                "makespan": tn_makespan,
+                "time_sec": tn_result.get("time", np.nan),
+                "status": tn_msg,
             }
         )
 
@@ -949,7 +1157,7 @@ def benchmark_fixed_C(
 # ============================================================
 
 def save_comparison_plot(
-    qubo_results,
+    results,
     y_column,
     ylabel,
     title,
@@ -957,17 +1165,44 @@ def save_comparison_plot(
     show_plot=False,
 ):
     """
-    Save a comparison plot for the two QUBO models.
+    Save a line comparison plot over fixed makespan values C.
     """
+    plot_results = results.copy()
+
+    if y_column not in plot_results.columns or plot_results.empty:
+        plot_results = pd.DataFrame(columns=["C", "model", y_column])
+    elif plot_results[y_column].dtype == bool:
+        plot_results[y_column] = plot_results[y_column].astype(int)
+    else:
+        plot_results[y_column] = pd.to_numeric(
+            plot_results[y_column],
+            errors="coerce",
+        )
+
+    plot_results = plot_results.dropna(subset=[y_column])
+
     plt.figure(figsize=(8, 5))
 
-    for model_name, group in qubo_results.groupby("model"):
+    for model_name, group in plot_results.groupby("model"):
+        group = group.sort_values("C")
         plt.plot(group["C"], group[y_column], marker="o", label=model_name)
 
     plt.xlabel("Fixed makespan C")
     plt.ylabel(ylabel)
     plt.title(title)
-    plt.legend()
+
+    if plot_results.empty:
+        plt.text(
+            0.5,
+            0.5,
+            "No data for selected benchmarks",
+            ha="center",
+            va="center",
+            transform=plt.gca().transAxes,
+        )
+    else:
+        plt.legend()
+
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(output_path, dpi=200)
@@ -1030,6 +1265,8 @@ def run_benchmark(args):
     """
     Run the full benchmark.
     """
+    args.benchmarks = normalize_benchmarks(getattr(args, "benchmarks", None))
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1041,18 +1278,38 @@ def run_benchmark(args):
     print("=" * 70)
     print(f"Known FT06 optimum makespan: {KNOWN_OPTIMUM}")
     print(f"Tested C values: {args.c_values}")
+    print(
+        "Selected benchmarks: "
+        + ", ".join(BENCHMARK_LABELS[name] for name in args.benchmarks)
+    )
     print(f"Simulated annealing reads: {args.num_reads}")
     print(f"Simulated annealing sweeps: {args.num_sweeps}")
     print(f"Output directory: {output_dir}")
     print()
 
-    print("Running CP-SAT optimization reference...")
-    opt_ref = solve_jsp_cpsat_optimize(JOBS_DATA, time_limit=args.cpsat_time_limit)
-    print("CP-SAT optimization reference:")
-    print(f"  status: {opt_ref['status']}")
-    print(f"  makespan: {opt_ref['makespan']}")
-    print(f"  time_sec: {opt_ref['time']:.4f}")
-    print()
+    if "cpsat" in args.benchmarks:
+        print("Running CP-SAT optimization reference...")
+        opt_ref = solve_jsp_cpsat_optimize(JOBS_DATA, time_limit=args.cpsat_time_limit)
+        print("CP-SAT optimization reference:")
+        print(f"  status: {opt_ref['status']}")
+        print(f"  makespan: {opt_ref['makespan']}")
+        print(f"  time_sec: {opt_ref['time']:.4f}")
+        print()
+
+    if "tn_lns" in args.benchmarks:
+        print("Running TN-LNS reference...")
+        tn_result = solve_jsp_tn_lns(
+            JOBS_DATA,
+            optimum=KNOWN_OPTIMUM,
+            seed=args.seed,
+        )
+        print("TN-LNS reference:")
+        print(f"  status: {tn_result['status']}")
+        print(f"  makespan: {tn_result['makespan']}")
+        print(f"  time_sec: {tn_result['time']:.4f}")
+        print()
+    else:
+        tn_result = None
 
     results = [
         benchmark_fixed_C(
@@ -1062,6 +1319,9 @@ def run_benchmark(args):
             num_sweeps=args.num_sweeps,
             seed=args.seed,
             cpsat_time_limit=args.cpsat_time_limit,
+            benchmarks=args.benchmarks,
+            known_optimum=KNOWN_OPTIMUM,
+            tn_result=tn_result,
         )
         for C in args.c_values
     ]
@@ -1078,7 +1338,12 @@ def run_benchmark(args):
     print(f"Saved reduction ratios to {ratios_path}")
 
     qubo_results = results_df[
-        results_df["model"].isin(["Time-indexed QUBO", "Compact disjunctive QUBO"])
+        results_df["model"].isin(
+            [
+                BENCHMARK_LABELS["time_indexed_qubo"],
+                BENCHMARK_LABELS["compact_disjunctive_qubo"],
+            ]
+        )
     ].copy()
 
     save_comparison_plot(
@@ -1096,17 +1361,39 @@ def run_benchmark(args):
         output_dir / "qubo_quadratic_terms_comparison.png",
     )
     save_comparison_plot(
-        qubo_results,
+        results_df,
         "time_sec",
         "Runtime (s)",
-        "QUBO runtime comparison",
-        output_dir / "qubo_runtime_comparison.png",
+        "Benchmark runtime comparison",
+        output_dir / "benchmark_runtime_comparison.png",
+    )
+    save_comparison_plot(
+        results_df,
+        "makespan",
+        "Makespan",
+        "Benchmark makespan comparison",
+        output_dir / "benchmark_makespan_comparison.png",
+    )
+
+    feasibility_results = results_df.copy()
+    feasibility_results["feasible_found"] = (
+        feasibility_results["feasible_found"].fillna(False).astype(bool).astype(int)
+    )
+
+    save_comparison_plot(
+        feasibility_results,
+        "feasible_found",
+        "Feasible found (1=yes, 0=no)",
+        "Benchmark feasibility comparison",
+        output_dir / "benchmark_feasibility_comparison.png",
     )
 
     print("Saved comparison plots to:")
     print(f"  {output_dir / 'qubo_variable_count_comparison.png'}")
     print(f"  {output_dir / 'qubo_quadratic_terms_comparison.png'}")
-    print(f"  {output_dir / 'qubo_runtime_comparison.png'}")
+    print(f"  {output_dir / 'benchmark_runtime_comparison.png'}")
+    print(f"  {output_dir / 'benchmark_makespan_comparison.png'}")
+    print(f"  {output_dir / 'benchmark_feasibility_comparison.png'}")
 
     return results_df, ratios_df
 
@@ -1143,6 +1430,16 @@ def main():
         type=float,
         default=5.0,
         help="CP-SAT time limit in seconds for fixed-C feasibility checks.",
+    )
+    parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        default=None,
+        help=(
+            "Benchmarks to run. Default: all. "
+            "Use any of: cpsat, time_indexed_qubo, compact_disjunctive_qubo, "
+            "tn_lns. Aliases such as classical, ti, compact, and tn are accepted."
+        ),
     )
     parser.add_argument(
         "--output-dir",

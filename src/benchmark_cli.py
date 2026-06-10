@@ -1,6 +1,7 @@
 import os
 from argparse import Namespace
 
+from jsp_qubo_benchmark import BENCHMARK_LABELS, DEFAULT_BENCHMARKS, normalize_benchmarks
 from run_instance_benchmark import load_dataset, run_instance_benchmark
 
 
@@ -216,6 +217,38 @@ def ask_c_values():
         return list(dict.fromkeys(values))
 
 
+def ask_benchmarks() -> list[str]:
+    """
+    Ask which benchmark methods to run.
+    """
+    print()
+    print("Benchmark methods:")
+    for index, name in enumerate(DEFAULT_BENCHMARKS, start=1):
+        print(f"  {index}. {BENCHMARK_LABELS[name]}")
+    print()
+    print("Press Enter for all, or enter numbers/names separated by spaces.")
+    print("Examples: 1 4, cpsat tn, ti compact")
+
+    number_to_name = {
+        str(index): name
+        for index, name in enumerate(DEFAULT_BENCHMARKS, start=1)
+    }
+
+    while True:
+        raw = input("Benchmarks to run [all]: ").strip()
+
+        if raw == "":
+            return list(DEFAULT_BENCHMARKS)
+
+        tokens = raw.replace(",", " ").split()
+        requested = [number_to_name.get(token, token) for token in tokens]
+
+        try:
+            return normalize_benchmarks(requested)
+        except ValueError as exc:
+            print(exc)
+
+
 def ask_max_workers() -> int:
     """
     Ask how many total worker processes to use.
@@ -255,21 +288,29 @@ def main():
     instances = dataset["instances"]
 
     instance_names = ask_instance_names(instances)
+    benchmarks = ask_benchmarks()
     run_settings = ask_run_mode()
     c_values = ask_c_values()
     max_workers = ask_max_workers()
     seed = ask_int("Random seed", 1)
 
-    run_extra_cpsat_opt = ask_yes_no(
-        "Run extra CP-SAT optimization reference before fixed-C benchmarks?",
-        default=True,
-    )
+    if "cpsat" in benchmarks:
+        run_extra_cpsat_opt = ask_yes_no(
+            "Run extra CP-SAT optimization reference before fixed-C benchmarks?",
+            default=True,
+        )
+    else:
+        run_extra_cpsat_opt = False
 
     print()
     print("=" * 70)
     print("Run summary")
     print("=" * 70)
     print(f"Instances: {', '.join(instance_names)}")
+    print(
+        "Benchmarks: "
+        + ", ".join(BENCHMARK_LABELS[name] for name in benchmarks)
+    )
     print(f"C-values: {'automatic per instance' if c_values is None else c_values}")
     print(f"num_reads: {run_settings['num_reads']}")
     print(f"num_sweeps: {run_settings['num_sweeps']}")
@@ -289,6 +330,7 @@ def main():
     args = Namespace(
         instances=instance_names,
         list_instances=False,
+        benchmarks=benchmarks,
         c_values=c_values,
         num_reads=run_settings["num_reads"],
         num_sweeps=run_settings["num_sweeps"],
