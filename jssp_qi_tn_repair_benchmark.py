@@ -2167,164 +2167,67 @@ for col in numeric_columns:
 
 
 # ============================================================
-# 18B. SCORE TABLE FOR THE THREE MAIN METRICS
+# 18. SUMMARY TABLE
 # ============================================================
 
-"""
-This table reports the three main benchmark metrics:
-
-    1. Robust_Makespan_Score
-    2. Total_Runtime_s
-    3. Size_Metric
-
-For all three metrics, lower is better.
-
-We also compute ranks:
-    rank 1 = best method for that instance and metric.
-"""
-
-score_table = summary[
-    [
-        "Instance",
-        "Method",
-        "Robust_Makespan_Score",
-        "Total_Runtime_s",
-        "Size_Metric",
-    ]
-].copy()
-
-# Rank each method inside each instance.
-# Lower value is better for all three metrics.
-score_table["Makespan_Rank"] = (
-    score_table
-    .groupby("Instance")["Robust_Makespan_Score"]
-    .rank(method="min", ascending=True)
+summary_base = (
+    results
+    .groupby(["Instance", "Method"], dropna=False)
+    .agg(
+        Avg_Makespan=("Makespan", "mean"),
+        Avg_Robust_Makespan=("Robust_Makespan", "mean"),
+        Worst_Robust_Makespan=("Robust_Makespan", "max"),
+        Total_Runtime_s=("Runtime_s", "sum"),
+        Avg_Runtime_s=("Runtime_s", "mean"),
+        Solved_Scenarios=("Feasible", "sum"),
+        Total_Scenarios=("Feasible", "count"),
+        Feasibility_Rate_pct=("Feasible", lambda x: 100.0 * x.mean()),
+        Jobs=("Jobs", "first"),
+        Machines=("Machines", "first"),
+        Operations=("Operations", "first"),
+        Rush_Jobs_Avg=("Rush_Jobs", "mean"),
+        Size_Metric=("Size_Metric", "first"),
+        Nq=("Nq", "first"),
+        Q_Size=("Q_Size", "first"),
+        Q_Density=("Q_Density", "first"),
+        Bond_Dim=("Bond_Dim", "first"),
+        TN_Sweeps=("TN_Sweeps", "mean"),
+        TN_Memory_MB=("TN_Memory_MB", "first"),
+    )
+    .reset_index()
 )
 
-score_table["Runtime_Rank"] = (
-    score_table
-    .groupby("Instance")["Total_Runtime_s"]
-    .rank(method="min", ascending=True)
+summary_base["Robust_Makespan_Score"] = (
+    ROBUST_AVG_WEIGHT * summary_base["Avg_Robust_Makespan"]
+    + ROBUST_WORST_WEIGHT * summary_base["Worst_Robust_Makespan"]
 )
 
-score_table["Size_Rank"] = (
-    score_table
-    .groupby("Instance")["Size_Metric"]
-    .rank(method="min", ascending=True)
-)
-
-# Average rank across the three metrics.
-score_table["Average_Rank"] = (
-    score_table[
-        [
-            "Makespan_Rank",
-            "Runtime_Rank",
-            "Size_Rank",
-        ]
-    ]
-    .mean(axis=1)
-)
-
-# Optional normalized score.
-# For each instance and each metric:
-#     best value gets 1.0
-#     larger values get proportionally worse scores.
-# Lower final score is still better.
-def normalized_metric_score(group, column):
-    values = group[column].astype(float)
-    best = values.min()
-
-    if best <= 0 or np.isnan(best):
-        return values / values.max()
-
-    return values / best
-
-
-score_table["Makespan_Normalized"] = (
-    score_table
-    .groupby("Instance", group_keys=False)
-    .apply(lambda g: normalized_metric_score(g, "Robust_Makespan_Score"))
-)
-
-score_table["Runtime_Normalized"] = (
-    score_table
-    .groupby("Instance", group_keys=False)
-    .apply(lambda g: normalized_metric_score(g, "Total_Runtime_s"))
-)
-
-score_table["Size_Normalized"] = (
-    score_table
-    .groupby("Instance", group_keys=False)
-    .apply(lambda g: normalized_metric_score(g, "Size_Metric"))
-)
-
-score_table["Combined_Normalized_Score"] = (
-    score_table[
-        [
-            "Makespan_Normalized",
-            "Runtime_Normalized",
-            "Size_Normalized",
-        ]
-    ]
-    .mean(axis=1)
-)
-
-# Round columns for clean display.
-for col in [
+round_cols = [
+    "Avg_Makespan",
+    "Avg_Robust_Makespan",
+    "Worst_Robust_Makespan",
     "Robust_Makespan_Score",
     "Total_Runtime_s",
+    "Avg_Runtime_s",
+    "Feasibility_Rate_pct",
+    "Rush_Jobs_Avg",
     "Size_Metric",
-    "Makespan_Rank",
-    "Runtime_Rank",
-    "Size_Rank",
-    "Average_Rank",
-    "Makespan_Normalized",
-    "Runtime_Normalized",
-    "Size_Normalized",
-    "Combined_Normalized_Score",
-]:
-    score_table[col] = pd.to_numeric(score_table[col], errors="coerce").round(4)
+    "Q_Density",
+    "TN_Sweeps",
+    "TN_Memory_MB",
+]
 
-# Sort by instance, then average rank.
-score_table = score_table.sort_values(
-    ["Instance", "Average_Rank", "Combined_Normalized_Score"]
-).reset_index(drop=True)
+for col in round_cols:
+    if col in summary_base.columns:
+        summary_base[col] = pd.to_numeric(summary_base[col], errors="coerce").round(4)
 
-print("\nTHREE-METRIC SCORE TABLE")
-print(score_table)
+summary = summary_base.copy()
 
+print("\nRUN-LEVEL RESULTS")
+print(results)
 
-# A compact winner table for each instance.
-winner_table = (
-    score_table
-    .sort_values(["Instance", "Average_Rank", "Combined_Normalized_Score"])
-    .groupby("Instance", as_index=False)
-    .first()
-)
-
-winner_table = winner_table[
-    [
-        "Instance",
-        "Method",
-        "Robust_Makespan_Score",
-        "Total_Runtime_s",
-        "Size_Metric",
-        "Average_Rank",
-        "Combined_Normalized_Score",
-    ]
-].copy()
-
-print("\nBEST METHOD BY THREE-METRIC SCORE")
-print(winner_table)
-
-
-# Save these score tables.
-score_table.to_csv("three_metric_score_table.csv", index=False)
-winner_table.to_csv("three_metric_winner_table.csv", index=False)
-
-print("\nSaved score tables:")
-print("three_metric_score_table.csv")
-print("three_metric_winner_table.csv")
+print("\nSUMMARY TABLE")
+print(summary)
 
 
 # ============================================================
