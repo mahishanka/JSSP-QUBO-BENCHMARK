@@ -122,7 +122,7 @@ NUM_DISRUPTION_SCENARIOS = 20
 
 # CP-SAT is intentionally given a short online repair time.
 # Increase/decrease this to control CP-SAT difficulty.
-CP_SAT_REPAIR_TIME_LIMIT = 0.03
+CP_SAT_REPAIR_TIME_LIMIT = 1.25
 
 # Optional longer CP-SAT reference is not used in the plots.
 # It is only stored for inspection.
