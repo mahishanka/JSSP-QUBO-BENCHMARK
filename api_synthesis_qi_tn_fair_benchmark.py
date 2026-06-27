@@ -25,7 +25,7 @@ Metrics compared:
 
 Compared methods:
     1. Incumbent Mixed Campaign
-    2. CP-SAT Flexible Equipment Model
+    2. CP-SAT Robust Flexible Equipment Model
     3. Classical Structured Simulated Annealing
     4. QI MPO-Hamiltonian Tensor-Network Campaign Repair
 
@@ -166,8 +166,8 @@ class BenchmarkConfig:
     TEMP_START: float = 350.0
     TEMP_END: float = 1.0
 
-    # Objective weights. These are used by every method through the same evaluator.
-    # Internal composite objective used by every method.
+    # Internal composite objective used by SA and QI, and used for audit.
+    # CP-SAT has a linear robust surrogate objective and is finally evaluated by the same evaluator.
     # It is built only from the four reported business goals:
     # throughput, makespan, cleaning/changeover, and due-date performance.
     OBJECTIVE_SETUP_WEIGHT: float = 0.35
@@ -175,9 +175,10 @@ class BenchmarkConfig:
     OBJECTIVE_LOST_THROUGHPUT_WEIGHT: float = 22.0
     OBJECTIVE_IDLE_WEIGHT: float = 0.0
 
-    # CP-SAT nominal model objective weights.
-    # CP-SAT is still finally evaluated by the same evaluator as every method.
+    # CP-SAT robust linear surrogate objective weights.
+    # CP-SAT is still finally evaluated by the same decoder/evaluator as every method.
     CPSAT_TARDINESS_WEIGHT: int = 1
+    CPSAT_LATE_DEMAND_WEIGHT: int = 20
 
     # MPO/TN-inspired QI parameters.
     # Bond dimension = number of retained candidate states after truncation.
@@ -927,6 +928,8 @@ def classical_structured_simulated_annealing(
 
     evaluated = 1
     no_improvement_rounds = 0
+    evaluated_signatures = {plan_signature(current)}
+    skipped_duplicate_candidates = 0
 
     while (
         time.perf_counter() < deadline
@@ -966,15 +969,21 @@ def classical_structured_simulated_annealing(
 
             assert is_valid_plan(batches, proposal)
 
-            if plan_signature(proposal) != current_sig:
-                candidate = proposal
-                break
+            proposal_sig = plan_signature(proposal)
+            if proposal_sig == current_sig or proposal_sig in evaluated_signatures:
+                skipped_duplicate_candidates += 1
+                continue
+
+            candidate = proposal
+            candidate_sig = proposal_sig
+            break
 
         # If all attempts returned a duplicate, do not spend a counted full
         # objective evaluation. QI uses the same principle for duplicate states.
         if candidate is None:
             continue
 
+        evaluated_signatures.add(candidate_sig)
         candidate_metrics = evaluate_campaign_plan(batches, scenarios, candidate)
         candidate_score = candidate_metrics["Objective"]
         evaluated += 1
@@ -1005,6 +1014,7 @@ def classical_structured_simulated_annealing(
         f"candidate_cap={CFG.LOCAL_MAX_EVALS}; "
         f"no_improvement_cap={CFG.MAX_NO_IMPROVEMENT_ROUNDS}; "
         f"final_no_improvement_count={no_improvement_rounds}; "
+        f"skipped_duplicate_candidates={skipped_duplicate_candidates}; "
         f"move_type=sequence_swap_insert_reverse_plus_equipment_reassignment_plus_shared_campaign_neighborhoods"
     )
 
@@ -2145,6 +2155,7 @@ def qi_mpo_hamiltonian_tn_campaign_repair(
     evaluated = 1
     skipped_duplicates = 0
     no_improvement_rounds = 0
+    evaluated_signatures = {plan_signature(current)}
     sweeps_done = 0
 
     products = sorted({batch["product"] for batch in batches})
@@ -2179,10 +2190,11 @@ def qi_mpo_hamiltonian_tn_campaign_repair(
                     break
 
                 sig = plan_signature(candidate_plan)
-                if sig in seen_this_expansion:
+                if sig in seen_this_expansion or sig in evaluated_signatures:
                     skipped_duplicates += 1
                     continue
                 seen_this_expansion.add(sig)
+                evaluated_signatures.add(sig)
 
                 candidate_metrics = evaluate_campaign_plan(batches, scenarios, candidate_plan)
                 candidate_score = candidate_metrics["Objective"]
@@ -2371,17 +2383,6 @@ def qi_mpo_hamiltonian_tn_campaign_repair(
 # ============================================================
 
 
-def nominal_scenario_from_scenarios(scenarios) -> Dict[str, List[int]]:
-    n = len(scenarios[0]["release"])
-    nominal = {"release": [], "due": [], "demand": []}
-
-    for j in range(n):
-        nominal["release"].append(int(round(np.mean([s["release"][j] for s in scenarios]))))
-        nominal["due"].append(int(round(np.mean([s["due"][j] for s in scenarios]))))
-        nominal["demand"].append(int(round(np.mean([s["demand"][j] for s in scenarios]))))
-
-    return nominal
-
 
 def horizon_bound(batches, scenarios) -> int:
     max_route = 0
@@ -2412,6 +2413,71 @@ def return_incumbent_result(
     )
 
 
+def decoded_operation_times_for_hints(batches, scenario: Dict[str, List[int]], plan: Dict[str, Any]):
+    """
+    Decode a plan and return operation start/end times for CP-SAT warm-start hints.
+
+    This mirrors decode_one_scenario. It is used only to provide hints from the
+    shared incumbent, not to give CP-SAT information unavailable to the other
+    methods.
+    """
+    sequence = plan["sequence"]
+    assignment = plan["assignment"]
+    n = len(batches)
+
+    priority = {job_id: pos for pos, job_id in enumerate(sequence)}
+    equipment_available = {eq: 0 for eq in STAGE_OF_EQUIPMENT}
+    equipment_last_product = {eq: None for eq in STAGE_OF_EQUIPMENT}
+    next_stage_index = {j: 0 for j in range(n)}
+    previous_stage_finish = {j: scenario["release"][j] for j in range(n)}
+    op_start = {}
+    op_end = {}
+
+    scheduled_operations = 0
+    total_operations = n * len(STAGES)
+
+    while scheduled_operations < total_operations:
+        candidates = []
+        for j in range(n):
+            stage_idx = next_stage_index[j]
+            if stage_idx >= len(STAGES):
+                continue
+            stage = STAGES[stage_idx]
+            eq = assignment[j][stage]
+            product = batches[j]["product"]
+            clean = setup_time(equipment_last_product[eq], product)
+            earliest_start = max(previous_stage_finish[j], equipment_available[eq] + clean)
+            candidates.append({
+                "batch": j,
+                "stage": stage,
+                "stage_idx": stage_idx,
+                "equipment": eq,
+                "clean": clean,
+                "earliest_start": earliest_start,
+                "priority": priority[j],
+            })
+
+        min_start = min(c["earliest_start"] for c in candidates)
+        eligible = [c for c in candidates if c["earliest_start"] <= min_start + CFG.DISPATCH_WINDOW]
+        chosen = min(eligible, key=lambda c: (c["priority"], c["earliest_start"], c["stage_idx"], c["batch"]))
+
+        j = chosen["batch"]
+        stage = chosen["stage"]
+        eq = chosen["equipment"]
+        start_time = int(chosen["earliest_start"])
+        finish_time = start_time + int(batches[j]["processing"][stage][eq])
+
+        op_start[j, stage] = start_time
+        op_end[j, stage] = finish_time
+        equipment_available[eq] = finish_time
+        equipment_last_product[eq] = batches[j]["product"]
+        previous_stage_finish[j] = finish_time
+        next_stage_index[j] += 1
+        scheduled_operations += 1
+
+    return op_start, op_end
+
+
 def cpsat_flexible_equipment_model(
     batches,
     scenarios,
@@ -2419,27 +2485,20 @@ def cpsat_flexible_equipment_model(
     time_budget: float,
 ):
     """
-    CP-SAT flexible equipment model for API synthesis campaign scheduling.
+    CP-SAT robust flexible equipment model for API synthesis campaign scheduling.
 
-    The CP-SAT model chooses equipment assignments and a nominal schedule for
-    the average scenario. The resulting equipment assignment and batch priority
-    sequence are then evaluated under all scenarios by the same final evaluator
-    used for every method.
+    Compared with the previous nominal CP-SAT version, this model is more
+    defensible for a paper-style benchmark because it optimizes all release/due/
+    demand scenarios simultaneously. Equipment assignments and pairwise equipment
+    orders are shared across scenarios, while start/end times are scenario-specific.
 
-    Fairness:
-        - same batches
-        - same four-stage route
-        - same compatible equipment sets
-        - same processing times
-        - same cleaning/changeover matrix
-        - same time budget
-        - same incumbent used as a warm-start hint
-        - same final scenario evaluator
+    The resulting equipment assignment and induced batch priority sequence are
+    still evaluated by the same final multi-scenario decoder as every method.
     """
     t0 = time.perf_counter()
 
     n = len(batches)
-    nominal = nominal_scenario_from_scenarios(scenarios)
+    scenario_count = len(scenarios)
     H = horizon_bound(batches, scenarios)
 
     model = cp_model.CpModel()
@@ -2448,42 +2507,36 @@ def cpsat_flexible_equipment_model(
     end = {}
     x = {}
 
+    # Shared equipment assignment variables.
     for j in range(n):
         for stage in STAGES:
-            start[j, stage] = model.NewIntVar(0, H, f"s_{j}_{stage}")
-            end[j, stage] = model.NewIntVar(0, H, f"e_{j}_{stage}")
-
             options = compatible_equipment(batches[j]["product"], stage)
             option_bools = []
-
             for eq in options:
                 x[j, stage, eq] = model.NewBoolVar(f"x_{j}_{stage}_{eq}")
                 option_bools.append(x[j, stage, eq])
-
             model.AddExactlyOne(option_bools)
 
-            # Processing time is selected by equipment assignment.
-            model.Add(
-                end[j, stage]
-                == start[j, stage]
-                + sum(
-                    batches[j]["processing"][stage][eq] * x[j, stage, eq]
-                    for eq in options
+    # Scenario-specific timing variables, with shared assignments.
+    for k, scenario in enumerate(scenarios):
+        for j in range(n):
+            for stage in STAGES:
+                start[k, j, stage] = model.NewIntVar(0, H, f"s_{k}_{j}_{stage}")
+                end[k, j, stage] = model.NewIntVar(0, H, f"e_{k}_{j}_{stage}")
+                options = compatible_equipment(batches[j]["product"], stage)
+                model.Add(
+                    end[k, j, stage]
+                    == start[k, j, stage]
+                    + sum(batches[j]["processing"][stage][eq] * x[j, stage, eq] for eq in options)
                 )
-            )
 
-    # Raw-material release before synthesis.
-    for j in range(n):
-        model.Add(start[j, "SYNTHESIS"] >= nominal["release"][j])
-
-    # Stage precedence.
-    for j in range(n):
-        for stage_a, stage_b in zip(STAGES[:-1], STAGES[1:]):
-            model.Add(start[j, stage_b] >= end[j, stage_a])
+            model.Add(start[k, j, "SYNTHESIS"] >= scenario["release"][j])
+            for stage_a, stage_b in zip(STAGES[:-1], STAGES[1:]):
+                model.Add(start[k, j, stage_b] >= end[k, j, stage_a])
 
     bool_count = 0
 
-    # Sequence-dependent setup constraints on each equipment unit.
+    # Shared sequence-dependent setup order on each equipment unit.
     for eq, eq_stage in STAGE_OF_EQUIPMENT.items():
         compatible_ops = [
             j for j in range(n)
@@ -2509,41 +2562,56 @@ def cpsat_flexible_equipment_model(
                 setup_ij = setup_time(batches[i]["product"], batches[j]["product"])
                 setup_ji = setup_time(batches[j]["product"], batches[i]["product"])
 
-                model.Add(
-                    start[j, eq_stage] >= end[i, eq_stage] + setup_ij
-                ).OnlyEnforceIf([x[i, eq_stage, eq], x[j, eq_stage, eq], y])
+                for k in range(scenario_count):
+                    model.Add(
+                        start[k, j, eq_stage] >= end[k, i, eq_stage] + setup_ij
+                    ).OnlyEnforceIf([x[i, eq_stage, eq], x[j, eq_stage, eq], y])
 
-                model.Add(
-                    start[i, eq_stage] >= end[j, eq_stage] + setup_ji
-                ).OnlyEnforceIf([x[i, eq_stage, eq], x[j, eq_stage, eq], y.Not()])
+                    model.Add(
+                        start[k, i, eq_stage] >= end[k, j, eq_stage] + setup_ji
+                    ).OnlyEnforceIf([x[i, eq_stage, eq], x[j, eq_stage, eq], y.Not()])
 
-    Cmax = model.NewIntVar(0, H, "Cmax")
-    for j in range(n):
-        model.Add(Cmax >= end[j, "PACKAGING"])
+    cmax_vars = []
+    tardiness_terms = []
+    late_demand_terms = []
 
-    tardiness_vars = []
-    for j in range(n):
-        tardy = model.NewIntVar(0, H, f"tardy_{j}")
-        model.Add(tardy >= end[j, "PACKAGING"] - nominal["due"][j])
-        model.Add(tardy >= 0)
-        tardiness_vars.append(tardy)
+    for k, scenario in enumerate(scenarios):
+        Cmax = model.NewIntVar(0, H, f"Cmax_{k}")
+        cmax_vars.append(Cmax)
+        for j in range(n):
+            model.Add(Cmax >= end[k, j, "PACKAGING"])
 
+            tardy = model.NewIntVar(0, H, f"tardy_{k}_{j}")
+            model.Add(tardy >= end[k, j, "PACKAGING"] - scenario["due"][j])
+            model.Add(tardy >= 0)
+            tardiness_terms.append(int(scenario["demand"][j]) * tardy)
+
+            late = model.NewBoolVar(f"late_{k}_{j}")
+            model.Add(end[k, j, "PACKAGING"] <= scenario["due"][j]).OnlyEnforceIf(late.Not())
+            model.Add(end[k, j, "PACKAGING"] >= scenario["due"][j] + 1).OnlyEnforceIf(late)
+            late_demand_terms.append(int(scenario["demand"][j]) * late)
+
+    # Robust CP-SAT objective aligned with the four business goals. Cleaning/setup
+    # already enters the sequencing constraints and therefore affects Cmax/tardiness.
     model.Minimize(
-        Cmax
-        + CFG.CPSAT_TARDINESS_WEIGHT * sum(tardiness_vars)
+        sum(cmax_vars)
+        + CFG.CPSAT_TARDINESS_WEIGHT * sum(tardiness_terms)
+        + CFG.CPSAT_LATE_DEMAND_WEIGHT * sum(late_demand_terms)
     )
 
-    # Warm-start hints from the shared incumbent decoded on the nominal scenario.
-    inc_metrics = decode_one_scenario(batches, nominal, incumbent_plan)
-    _ = inc_metrics  # kept for transparency/debugging if printed later
-
-    # Reconstruct an approximate incumbent schedule for hints.
-    # The hints are optional; final fairness comes from the common evaluator.
+    # Warm-start hints from the shared incumbent for both assignments and timing.
     for j in range(n):
         for stage in STAGES:
             eq_hint = incumbent_plan["assignment"][j][stage]
             for eq in compatible_equipment(batches[j]["product"], stage):
                 model.AddHint(x[j, stage, eq], 1 if eq == eq_hint else 0)
+
+    for k, scenario in enumerate(scenarios):
+        hint_start, hint_end = decoded_operation_times_for_hints(batches, scenario, incumbent_plan)
+        for j in range(n):
+            for stage in STAGES:
+                model.AddHint(start[k, j, stage], int(hint_start[j, stage]))
+                model.AddHint(end[k, j, stage], int(hint_end[j, stage]))
 
     build_time = time.perf_counter() - t0
     remaining = time_budget - build_time
@@ -2588,12 +2656,13 @@ def cpsat_flexible_equipment_model(
                 chosen_eq = incumbent_plan["assignment"][j][stage]
             assignment[j][stage] = chosen_eq
 
-    # Convert CP-SAT schedule into the shared plan representation.
-    # Batch priority is based on nominal synthesis start time.
-    sequence = sorted(
-        range(n),
-        key=lambda j: (solver.Value(start[j, "SYNTHESIS"]), j),
-    )
+    # Convert the robust CP-SAT schedule into the common plan representation.
+    # The priority sequence is sorted by mean synthesis start over scenarios.
+    mean_synthesis_start = {
+        j: float(np.mean([solver.Value(start[k, j, "SYNTHESIS"]) for k in range(scenario_count)]))
+        for j in range(n)
+    }
+    sequence = sorted(range(n), key=lambda j: (mean_synthesis_start[j], j))
 
     plan = {
         "sequence": sequence,
@@ -2601,16 +2670,16 @@ def cpsat_flexible_equipment_model(
     }
 
     assert is_valid_plan(batches, plan)
-
     metrics = evaluate_campaign_plan(batches, scenarios, plan)
     status_name = "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE"
 
     info = (
         f"Status={status_name}; "
         f"order_binaries={bool_count}; "
+        f"scenario_timing_vars={scenario_count * n * len(STAGES) * 2}; "
         f"start=shared_incumbent_hint; "
         f"time_budget={time_budget}; "
-        f"nominal_model=evaluated_robustly_after_solve"
+        f"robust_model=evaluated_by_same_final_decoder"
     )
 
     return plan, metrics, runtime, info
@@ -2673,7 +2742,7 @@ def run_trial(trial_id: int):
     rows.append(
         method_row(
             trial_id,
-            "CP-SAT Flexible Equipment Model",
+            "CP-SAT Robust Flexible Equipment Model",
             cp_metrics,
             cp_runtime,
             cp_info,
@@ -2809,8 +2878,8 @@ def print_fairness_statement():
     print("cleaning/changeover matrix, initial incumbent plan, decoder, final")
     print("evaluation function, and four reported metrics are identical across methods.")
     print("Classical structured SA and QI use the same scalar acceptance score for evaluated candidates;")
-    print("CP-SAT optimizes a nominal finite-horizon model and is then evaluated")
-    print("by the same final multi-scenario evaluator as every other method.")
+    print("CP-SAT optimizes a robust finite-horizon model over the same scenarios and is then evaluated")
+    print("by the same final multi-scenario decoder and evaluator as every other method.")
     print("CP-SAT, classical simulated annealing, and QI receive the same maximum")
     print("wall-clock time budget. CP-SAT uses one worker by default so it does")
     print("not receive extra CPU parallelism relative to the single-threaded heuristics.")
